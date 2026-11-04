@@ -22,6 +22,7 @@ from .._browser import create_browser_sync, create_context_sync
 from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
+    merge_title_into_desc,
     parse_schedule_time,
     raise_if_page_closed,
     save_login_result,
@@ -756,8 +757,8 @@ class BaijiahaoPlatform(BasePlatform):
         to trigger the topic search dropdown, then the first suggestion is
         selected.
         """
-        # 描述为空时不再回落标题，保持为空
-        desc_text = (desc or "").strip()[:2000]
+        # 该页只有「作品描述」(Lexical 编辑器),把标题并进描述首行,避免标题被静默丢弃
+        desc_text = merge_title_into_desc(title, desc, limit=2000)
 
         # Lexical contenteditable editor
         lexical_editor = page.locator('[data-lexical-editor="true"]')

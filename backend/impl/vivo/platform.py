@@ -25,6 +25,7 @@ from conf import BASE_DIR
 from .._browser import create_browser_sync, create_context_sync
 from .._utils import (
     get_account_name_by_cookie_file,
+    merge_title_into_desc,
     parse_schedule_time,
     raise_if_page_closed,
     save_login_result,
@@ -459,13 +460,14 @@ class VivoPlatform(BasePlatform):
 
                 # 3. 视频描述 + 标签(#xxx 直接拼在描述里,总长≤500字)
                 # contenteditable 富文本,按 CLAUDE.md 用 press_sequentially 逐字符输入
-                full_desc = desc or ""
+                # 该页只有「视频描述」一个输入框,标题并进描述首行,避免标题被静默丢弃
                 has_tags = bool(tags)
-                if has_tags:
-                    tag_str = " ".join(f"#{t}" for t in tags if t)
-                    if tag_str:
-                        full_desc = (full_desc + " " + tag_str).strip()
-                # VIVO 描述上限 500 字
+                tag_str = " ".join(f"#{t}" for t in tags if t) if has_tags else ""
+                # VIVO 描述上限 500 字:先给标签预留空间,再截断描述
+                desc_limit = 500 - (len(tag_str) + 1 if tag_str else 0)
+                full_desc = merge_title_into_desc(title, desc, limit=max(desc_limit, 0))
+                if tag_str:
+                    full_desc = (full_desc + " " + tag_str).strip()
                 full_desc = full_desc[:500]
 
                 if full_desc:
