@@ -22,6 +22,7 @@ from .._browser import create_browser_sync, create_context_sync
 from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
+    merge_title_into_desc,
     parse_schedule_time,
     raise_if_page_closed,
     save_login_result,
@@ -785,8 +786,8 @@ class KuaishouPlatform(BasePlatform):
             logger.info("[填写简介] 开始填写简介与标签...")
             await page.get_by_text("描述").locator("xpath=following-sibling::div").click()
             # 清空后输入(跨平台:Mac 用 Cmd+A,其他用 Ctrl+A)
-            # 描述为空时不再回落标题：描述就保持为空
-            await clear_and_type(page, desc)
+            # 该页只有「作品描述」一个输入框,把标题并进描述首行,避免标题被静默丢弃
+            await clear_and_type(page, merge_title_into_desc(title, desc)[:500])
             await pause_after_input()
             await page.keyboard.press("Enter")
             logger.info("[填写简介] 简介填写完成")

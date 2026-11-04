@@ -1552,3 +1552,27 @@ async def clear_and_type(page, text: str, element=None, delay: int = 0):
             await page.keyboard.type(text, delay=delay)
         else:
             await page.keyboard.type(text)
+
+
+def merge_title_into_desc(title: str, desc: str, limit: int | None = None) -> str:
+    """把标题并到描述前面,用于没有独立标题输入框的平台。
+
+    快手视频 / 萌视 / 百家号只有「作品描述」一个输入框。若只填 desc,
+    用户在发布中心填写的标题会被静默丢弃,因此统一按「标题 + 换行 + 描述」
+    拼接,与快手图集链路(_upload_image_note)的既有做法保持一致。
+
+    Args:
+        title: 发布中心填写的标题,可为空
+        desc: 作品描述,可为空
+        limit: 可选长度上限(按字符计),命中时直接截断
+
+    Returns:
+        合并后的文本;两者都为空时返回空字符串。
+    """
+    title = (title or "").strip()
+    desc = (desc or "").strip()
+    if title and desc:
+        text = f"{title}\n{desc}"
+    else:
+        text = title or desc
+    return text[:limit] if limit is not None else text
