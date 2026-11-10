@@ -473,6 +473,17 @@ def _serialize_batch_with_items(b, items):
             or _resolve_cover_from_path(first_cfg.get('thumbnail_path', ''))
             or _resolve_cover_from_path(first_cfg.get('coverStoredPath', ''))
         )
+    # 图集批次(type=image)未单独选封面时,landscape/portrait_cover_material_id
+    # 均为空,而图集明细没有 coverLandscape 等字段 → 兜底链全部落空。
+    # 取 image_material_ids 首图作为封面(2026-11-10)
+    image_first_cover_url = ''
+    if not fallback_cover_url and b.get('type') == 'image':
+        try:
+            image_ids = json.loads(b.get('image_material_ids') or '[]')
+            if image_ids:
+                image_first_cover_url = _resolve_cover_url(image_ids[0])
+        except (json.JSONDecodeError, TypeError):
+            pass
     # 批次级聚合统计：各 detail 最新快照同指标分别求和（全 null 则省略该键）。
     # detail 的 stats 已由 _normalize_detail_row 注入，这里直接累加即可。
     aggregate_stats = {}
@@ -491,7 +502,8 @@ def _serialize_batch_with_items(b, items):
         'portrait_cover_material_id': b.get('portrait_cover_material_id', ''),
         'cover_url': _resolve_cover_url(b.get('landscape_cover_material_id', ''))
                     or _resolve_cover_url(b.get('portrait_cover_material_id', ''))
-                    or fallback_cover_url,
+                    or fallback_cover_url
+                    or image_first_cover_url,
         'account_count': b.get('account_count', 0),
         'success_count': b.get('success_count', 0),
         'failed_count': b.get('failed_count', 0),

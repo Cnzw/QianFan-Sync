@@ -3830,20 +3830,36 @@ class WeiboPlatform(BasePlatform):
 
     @staticmethod
     async def _article_statement_option_rect(page, target):
-        """「内容声明」子菜单选项坐标。"""
+        """「内容声明」子菜单选项坐标。
+
+        主匹配 `.extend-box__content__item` 精确文本; 类名改版时兜底
+        `.extend-box` 内任意可见叶子节点的精确文本(2026-11-10 发布实测
+        子菜单偶发未展开/类名差异导致匹配落空)。
+        """
         return await page.evaluate(
             """(target) => {
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 return r.width > 0 && r.height > 0;
               };
+              const center = (el) => {
+                const r = el.getBoundingClientRect();
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+              };
               const items = [...document.querySelectorAll(
                   '.extend-box__content__item')].filter(
                 (el) => vis(el)
                   && (el.innerText || '').trim() === target);
-              if (!items.length) return null;
-              const r = items[0].getBoundingClientRect();
-              return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+              if (items.length) return center(items[0]);
+              // 兜底: extend-box 容器内最深匹配叶子
+              const box = [...document.querySelectorAll('.extend-box')]
+                .find(vis);
+              if (!box) return null;
+              const leaves = [...box.querySelectorAll('*')].filter(
+                (el) => vis(el) && el.children.length === 0
+                  && (el.innerText || '').trim() === target);
+              // 取最浅匹配(标题容器等祖先已在叶子过滤中排除)
+              return leaves.length ? center(leaves[0]) : null;
             }""",
             target,
         )
@@ -3973,19 +3989,39 @@ class WeiboPlatform(BasePlatform):
             entry = await self._article_dropdown_extend_rect(page, "公开")
             if not entry:
                 raise RuntimeError("未找到内容声明入口(公开项右侧)")
-            await page.mouse.move(entry["x"], entry["y"])
-            await asyncio.sleep(1.2)
-            opt = await self._article_statement_option_rect(
-                page, target_statement
-            )
-            if not opt:
-                await asyncio.sleep(1.5)
+            # 子菜单偶发不展开(hover 事件丢失/动画竞态):重试时先移开鼠标
+            # 再重新悬停入口,重新触发 hover 展开(2026-11-10 发布实测)
+            opt = None
+            for attempt in range(3):
+                if attempt > 0:
+                    entry2 = await self._article_dropdown_extend_rect(
+                        page, "公开"
+                    )
+                    if not entry2:
+                        break
+                    await page.mouse.move(
+                        trig2["x"] - 60, trig2["y"] - 30, steps=6
+                    )
+                    await asyncio.sleep(0.6)
+                    await page.mouse.move(
+                        entry2["x"], entry2["y"], steps=6
+                    )
+                    await asyncio.sleep(1.5)
+                else:
+                    await page.mouse.move(entry["x"], entry["y"], steps=6)
+                    await asyncio.sleep(1.2)
                 opt = await self._article_statement_option_rect(
                     page, target_statement
                 )
+                if opt:
+                    break
             if not opt:
+                await self._article_screenshot(
+                    page, "weibo_article_stmt_menu_fail.png"
+                )
                 raise RuntimeError(
                     f"未找到内容声明选项: {target_statement}"
+                    "(子菜单未展开, 已截图 weibo_article_stmt_menu_fail)"
                 )
             await page.mouse.move(opt["x"], opt["y"])
             await asyncio.sleep(0.3)
@@ -4542,6 +4578,67 @@ class WeiboPlatform(BasePlatform):
         return None
 
     @classmethod
+    @classmethod
+    def _wb_mblog_to_image_work(cls, item, uid):
+        """单条 mblog JSON → 契约 dict(图集/图文稿件)。无图稿件返回 None。
+
+        图集(微博图片 album)与多图图文都是带 pic_infos/pics 的普通 mblog:
+        - work_id = mblogid; url = https://weibo.com/<uid>/<mblogid>
+        - 标题 = 正文去 HTML(发布图集无标题概念, 文本即描述)
+        - 发布时间/赞/评/转 与视频稿件同字段; 无播放量与收藏
+        """
+        if not isinstance(item, dict):
+            return None
+        work_id = item.get("mblogid") or str(item.get("id") or "")
+        if not work_id:
+            return None
+        pic_infos = item.get("pic_infos") or {}
+        pics = item.get("pic_ids") or item.get("pics") or []
+        if not pic_infos and not pics:
+            return None
+
+        text = re.sub(r"<[^>]+>", "", item.get("text") or "")
+        title = re.sub(r"\s+", " ", text).strip()[:120]
+
+        created_at = item.get("created_at") or ""
+        publish_time = created_at
+        try:
+            publish_time = datetime.strptime(
+                created_at, "%a %b %d %H:%M:%S %z %Y"
+            ).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            pass
+
+        likes = item.get("attitudes_count")
+        likes = (
+            likes if isinstance(likes, int)
+            else cls._wb_num_from_display(item.get("number_display"), "like_count")
+        )
+        comments = item.get("comments_count")
+        comments = (
+            comments if isinstance(comments, int)
+            else cls._wb_num_from_display(item.get("number_display"), "comment_count")
+        )
+        share = item.get("reposts_count")
+        share = (
+            share if isinstance(share, int)
+            else cls._wb_num_from_display(item.get("number_display"), "repeat_count")
+        )
+
+        return {
+            "work_id": work_id,
+            "work_type": "image",
+            "title": title,
+            "publish_time": publish_time,
+            "url": f"https://weibo.com/{uid}/{work_id}",
+            "views": None,
+            "likes": likes,
+            "favorites": None,
+            "comments": comments,
+            "share": share,
+        }
+
+    @classmethod
     def _wb_mblog_to_work(cls, item, uid):
         """单条 mblog JSON → 契约 dict。非视频稿件返回 None。"""
         if not isinstance(item, dict):
@@ -4629,8 +4726,10 @@ class WeiboPlatform(BasePlatform):
         - ⚠️ 当前账号 YI32863 的 cookie 服务端会话已失效(retcode=6102)，
           本实现尚无登录态实测样例，待重新登录后需跑一次验证。
         """
-        if work_type != "video":
+        if work_type not in ("video", "image", ""):
             return []
+        # image(图集/图文): 个人主页全部微博里带图的稿件; video: 视频 tab
+        is_image_mode = work_type == "image"
 
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
         browser = await self.create_browser(headless=True)
@@ -4693,10 +4792,15 @@ class WeiboPlatform(BasePlatform):
 
             page.on("response", on_response)
 
-            for tab_url in (
-                f"https://weibo.com/u/{uid}?tab=video",
-                f"https://weibo.com/u/{uid}?tabtype=video",
-            ):
+            if is_image_mode:
+                # 全部微博 tab(图集是带 pic_infos 的普通稿件,混在全部列表里)
+                tab_urls = (f"https://weibo.com/u/{uid}",)
+            else:
+                tab_urls = (
+                    f"https://weibo.com/u/{uid}?tab=video",
+                    f"https://weibo.com/u/{uid}?tabtype=video",
+                )
+            for tab_url in tab_urls:
                 try:
                     await page.goto(
                         tab_url, wait_until="domcontentloaded", timeout=30000
@@ -4712,14 +4816,16 @@ class WeiboPlatform(BasePlatform):
                 if captured:
                     break
 
-            # 4. 兜底: 页内 fetch mymblog(feature=2 = 视频) —— 拦截空时才调
+            # 4. 兜底: 页内 fetch mymblog(视频 feature=2 / 图文 feature=1)
+            #    —— 拦截空时才调
             if not captured:
+                feature = 1 if is_image_mode else 2
                 body = await page.evaluate(
-                    """async (uid) => {
+                    """async ([uid, feature]) => {
                         try {
                             const resp = await fetch(
                                 '/ajax/statuses/mymblog?uid=' + uid
-                                + '&page=1&feature=2',
+                                + '&page=1&feature=' + feature,
                                 {credentials: 'include'},
                             );
                             return await resp.json();
@@ -4727,7 +4833,7 @@ class WeiboPlatform(BasePlatform):
                             return {ok: 0, err: String(e)};
                         }
                     }""",
-                    uid,
+                    [uid, feature],
                 )
                 if isinstance(body, dict) and body.get("ok") == 1:
                     captured.append(body)
@@ -4742,12 +4848,19 @@ class WeiboPlatform(BasePlatform):
                     or []
                 )
                 for item in items:
-                    work = self._wb_mblog_to_work(item, uid)
+                    work = (
+                        self._wb_mblog_to_image_work(item, uid)
+                        if is_image_mode
+                        else self._wb_mblog_to_work(item, uid)
+                    )
                     if work and work["work_id"] not in seen:
                         seen.add(work["work_id"])
                         works.append(work)
             works = works[: max(1, min(int(limit or 20), 50))]
-            logger.info("[weibo list_works] 抓到 %d 条视频作品", len(works))
+            logger.info(
+                "[weibo list_works] 抓到 %d 条%s作品",
+                len(works), "图文/图集" if is_image_mode else "视频",
+            )
             return works
         except Exception as e:
             logger.info(f"[weibo list_works] 抓取失败: {e}")
