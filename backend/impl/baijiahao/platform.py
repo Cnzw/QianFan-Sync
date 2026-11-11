@@ -824,10 +824,106 @@ class BaijiahaoPlatform(BasePlatform):
             logger.warning("[填写标题] 未找到描述输入框，跳过填充")
             return
 
-        # 1. 清空编辑器 + 输入描述文本(跨平台:Mac 用 Cmd+A,其他用 Ctrl+A)
-        await editor.click()
+        # 1. 清空编辑器 + 输入描述文本
+        # 踩点(2026-11-11):「新增智能文案…我知道了」推广气泡
+        # (cheetah-popconfirm) 锚定在描述编辑器正上方, 拦截指针点击
+        # (force click 也会被气泡接收, 焦点进不了编辑器); 且百家号上传后
+        # 会把视频文件名预填进描述框 —— 点掉气泡 + 点击后校验聚焦 +
+        # focus() 兜底 + 输入后校验文本, 四重防护
+        try:
+            know_btn = page.locator(
+                ".cheetah-popconfirm :text('我知道了')"
+            ).first
+            if await know_btn.count() and await know_btn.is_visible():
+                await know_btn.click(timeout=3000)
+                await asyncio.sleep(0.5)
+                logger.info("[填写标题] 已关闭「智能文案」推广气泡")
+        except Exception:
+            pass
+
+        clicked = False
+        click_err = None
+        for attempt in range(3):
+            try:
+                await BaijiahaoPlatform._dismiss_platform_modals(page)
+                if attempt > 0:
+                    try:
+                        await editor.scroll_into_view_if_needed(timeout=3000)
+                    except Exception:
+                        pass
+                    await editor.click(
+                        timeout=15000, force=(attempt == 2)
+                    )
+                else:
+                    await editor.click(timeout=15000)
+                clicked = True
+                break
+            except Exception as exc:
+                click_err = exc
+                logger.warning(
+                    "[填写标题] 编辑器点击失败(第 %d/3 次): %s",
+                    attempt + 1, exc,
+                )
+                await asyncio.sleep(1.5)
+        if not clicked:
+            try:
+                await page.screenshot(
+                    path=str(
+                        Path(BASE_DIR / "logs" / "baijiahao_editor_click_fail.png")
+                    ),
+                    full_page=True,
+                )
+            except Exception:
+                pass
+            raise click_err
+
+        # 聚焦校验: 指针点击被残余浮层拦截(焦点未进编辑器)时用 focus() 兜底
+        focused = await page.evaluate(
+            """() => {
+              const ed = document.querySelector('[data-lexical-editor="true"]');
+              const ae = document.activeElement;
+              return !!ed && (ae === ed || ed.contains(ae));
+            }"""
+        )
+        if not focused:
+            logger.info("[填写标题] 点击后焦点未进编辑器, 用 focus() 兜底")
+            await editor.evaluate("e => e.focus()")
+            focused = await page.evaluate(
+                """() => {
+                  const ed = document.querySelector('[data-lexical-editor="true"]');
+                  const ae = document.activeElement;
+                  return !!ed && (ae === ed || ed.contains(ae));
+                }"""
+            )
+        if not focused:
+            raise RuntimeError("百家号描述编辑器无法聚焦")
+
+        # 全选删除(百家号会把视频文件名预填进描述框) + 输入描述
+        await page.keyboard.press("Control+a")
+        await page.keyboard.press("Backspace")
         await asyncio.sleep(0.3)
-        await clear_and_type(page, desc_text, delay=50)
+        if desc_text:
+            await page.keyboard.insert_text(desc_text)
+            await asyncio.sleep(0.5)
+        # 输入校验: lexical 编辑器为受控组件, 键入失败时最终文本仍是预填
+        # 的文件名 —— 校验不通过留存截图并报错, 防止「标题变文件名」
+        final_text = await editor.evaluate(
+            "e => (e.innerText || '').trim()"
+        )
+        if desc_text and desc_text not in final_text:
+            try:
+                await page.screenshot(
+                    path=str(
+                        Path(BASE_DIR / "logs" / "baijiahao_desc_fill_fail.png")
+                    ),
+                    full_page=True,
+                )
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"百家号作品描述填充失败: 编辑器当前文本={final_text[:60]!r},"
+                f" 期望包含={desc_text[:40]!r}"
+            )
         if desc_text:
             logger.info("[填写标题] 已填充作品描述: %s", desc_text)
 

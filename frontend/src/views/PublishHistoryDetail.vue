@@ -363,20 +363,18 @@ const syncing = ref(false)
 let syncTimer = null
 
 // 本批次所有发布成功明细的 id：本次同步的范围
-function successDetailIds() {
-  return (batch.value?.items || []).filter(it => it.status === 'success').map(it => it.id)
-}
-
 async function syncWorks() {
+  // 只同步当前选中账号的明细(此前是整批次全部成功账号一起同步,
+  // 多账号时任意账号点同步所有按钮都转圈、且耗时成倍增长)
   if (syncing.value) return  // 同一时刻只允许一个同步在跑
-  const detailIds = successDetailIds()
-  if (detailIds.length === 0) {
-    ElMessage.info('该批次没有发布成功的记录，无需同步')
+  const detailId = selectedItem.value?.id
+  if (!detailId || selectedItem.value?.status !== 'success') {
+    ElMessage.info('当前账号没有发布成功，无需同步')
     return
   }
   syncing.value = true
   try {
-    await worksApi.sync(detailIds)
+    await worksApi.sync([detailId])
   } catch (e) {
     syncing.value = false
     ElMessage.error('触发同步失败: ' + (e?.message || e))
