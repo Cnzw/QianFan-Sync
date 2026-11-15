@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 
@@ -1266,6 +1268,151 @@ class ChannelsPlatform(BasePlatform):
     # 仅灌 cookie 可能 sync 拉不到资料，需用户自行验证）
     supports_cookie_import = True
     platform_cookie_domain = ".qq.com"
+
+    # ------------------------------------------------------------------
+    # List works (作品列表抓取: 作品关联 + 统计同步)
+    # ------------------------------------------------------------------
+
+    # 内容管理列表接口(页面加载时自动请求)
+    _FINDER_POST_LIST_URL_KEYWORD = "mmfinderassistant-bin/post/post_list"
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取视频号助手「内容管理-视频」列表(按发布时间倒序)。
+
+        实现(2026-11-15 踩点):
+        - 打开 TENCENT_MANAGE_URL, 页面自己请求
+          ``/cgi-bin/mmfinderassistant-bin/post/post_list``, 响应
+          ``data.list[]``: objectId('export/..' 形式) / createTime(epoch) /
+          desc.description(视频号作品无独立标题, 标题=描述文本) /
+          readCount / likeCount / commentCount / forwardCount / favCount
+        - 分享链接需要含 $nid 后缀的完整 feedId(API 不提供) → url 留空
+          (契约允许: 统计仍可同步)
+        - 登录态判定: 跳到 login.html 即失效 → log + return []
+        - work_type 仅支持 'video'(本账号列表为视频管理页); 其它 → []
+        - 列表偶发不加载(限流/懒加载), goto 后最长 90s 等接口, 未捕获重试一次
+        """
+        if work_type not in ("video", ""):
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                captured: list = []
+
+                async def _on_response(resp):
+                    if self._FINDER_POST_LIST_URL_KEYWORD not in resp.url:
+                        return
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        return
+                    if isinstance(body, dict) and body.get("errCode") == 0:
+                        captured.append(body)
+
+                page.on("response", _on_response)
+
+                for attempt in range(2):
+                    captured.clear()
+                    try:
+                        await page.goto(
+                            TENCENT_MANAGE_URL,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                    except Exception as exc:
+                        logger.info(
+                            "[channels list_works] goto 失败: %s", exc
+                        )
+                        continue
+                    if "login.html" in page.url:
+                        logger.info(
+                            "[channels list_works] cookie 失效(跳登录页)"
+                        )
+                        return []
+                    # 等列表接口(最长 90s; 限流/懒加载时较慢)
+                    for _ in range(45):
+                        if captured:
+                            break
+                        await asyncio.sleep(2)
+                    if captured:
+                        break
+                    logger.info(
+                        "[channels list_works] 第 %d 次未捕获列表接口, 重试",
+                        attempt + 1,
+                    )
+
+                works, seen = [], set()
+                for body in captured:
+                    lst = ((body.get("data") or {}).get("list")) or []
+                    for item in lst:
+                        work = self._finder_post_to_work(item)
+                        if work and work["work_id"] not in seen:
+                            seen.add(work["work_id"])
+                            works.append(work)
+                works = works[: max(1, min(int(limit or 20), 50))]
+                logger.info("[channels list_works] 抓到 %d 条作品", len(works))
+                return works
+            except Exception as e:
+                logger.info(f"[channels list_works] 抓取失败: {e}")
+                return []
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        finally:
+            await self.close_browser(browser, is_close_by_code=True)
+
+    @staticmethod
+    def _finder_post_to_work(item) -> dict | None:
+        """单条 post_list JSON → 契约 dict。
+
+        视频号作品无独立标题: desc.description 即标题(含 #话题)。
+        """
+        if not isinstance(item, dict):
+            return None
+        work_id = str(item.get("objectId") or "").strip()
+        if not work_id:
+            return None
+
+        desc = item.get("desc") or {}
+        title = ""
+        if isinstance(desc, dict):
+            title = re.sub(
+                r"\s+", " ",
+                (desc.get("description") or ""),
+            ).strip()[:120]
+
+        ts = item.get("createTime")
+        publish_time = ""
+        if isinstance(ts, (int, float)) and ts > 0:
+            try:
+                publish_time = datetime.fromtimestamp(int(ts)).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except (ValueError, OSError, OverflowError):
+                pass
+
+        def _int(v):
+            return v if isinstance(v, int) else None
+
+        return {
+            "work_id": work_id,
+            "work_type": "video",
+            "title": title,
+            "publish_time": publish_time,
+            # 分享链接需含 $nid 后缀的完整 feedId, post_list 不提供 → 留空
+            "url": "",
+            "views": _int(item.get("readCount")),
+            "likes": _int(item.get("likeCount")),
+            "favorites": _int(item.get("favCount")),
+            "comments": _int(item.get("commentCount")),
+            "share": _int(item.get("forwardCount")),
+        }
 
     # 视频发布支持「存草稿」:is_draft=True 时点「保存草稿」而非发表
     # (_submit_publish 已按 is_draft 分流)

@@ -127,11 +127,17 @@
                   >取消发布</el-button>
                   <el-button size="small" :loading="syncing" @click="syncWorks">同步数据</el-button>
                   <el-button
-                    v-if="selectedItem.status === 'success' && !selectedItem.publish_url"
+                    v-if="selectedItem.status === 'success' && !selectedItem.publish_url && !selectedItem.work_id"
                     size="small"
                     :loading="rebinding"
                     @click="rebindWorks"
                   >重新关联</el-button>
+                  <!-- 已关联但平台不提供作品链接(如视频号): 不显示重新关联
+                       (重绑也拿不到链接), 用弱提示说明状态 -->
+                  <span
+                    v-else-if="selectedItem.status === 'success' && !selectedItem.publish_url && selectedItem.work_id"
+                    class="bound-no-link"
+                  >已关联作品</span>
                   <el-button
                     v-if="selectedItem.status === 'success' && selectedItem.publish_url"
                     size="small"
@@ -1002,6 +1008,13 @@ onMounted(async () => {
     display: flex;
     align-items: center;
     flex-shrink: 0;
+  }
+
+  // 已关联作品但平台不提供链接时的弱提示(如视频号)
+  .bound-no-link {
+    margin-left: 4px;
+    font-size: 12px;
+    color: $text-muted;
   }
 
   .view-link {
