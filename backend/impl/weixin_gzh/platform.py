@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from urllib.parse import unquote, urlparse
@@ -80,6 +81,28 @@ _COOKIE_INVALID_URL_MARKERS = (
     "/cgi-bin/bizlogin",
     "/cgi-bin/loginpage",
 )
+
+# 发表记录列表接口（list_works 数据源，token 由 _resolve_token 拼装）。
+# 一次请求拿全已发表内容（发布+群发）；publish_page 字段是 JSON 字符串需
+# 二次 loads，内含 aid / 标题 / 公开链接 / 发布时间，但无阅读等统计。
+_PUBLISH_LIST_PATH = (
+    "https://mp.weixin.qq.com/cgi-bin/appmsgpublish"
+    "?sub=list&begin=0&count=50&query=&type=101_1_102_103&show_type="
+    "&free_publish_type=1_102_103&sub_action=list_ex&search_card=0"
+    "&token={token}&lang=zh_CN&f=json&ajax=1"
+)
+# 内容分析「已发表内容」单篇统计接口（list_works 补阅读数用）。
+# 只返回产生过阅读数据的内容：新发布内容数据 T+1 才生成，未出现的作品
+# views 保持默认 0，后续同步轮快照自动覆盖为真实阅读数。
+_ARTICLE_STAT_PATH = (
+    "https://mp.weixin.qq.com/misc/appmsganalysis"
+    "?action=get_article_list&begin_timestamp={begin}&end_timestamp={end}"
+    "&article_source=9999&offset=0&count=50&token={token}&lang=zh_CN&f=json&ajax=1"
+)
+# 发表记录 item_show_type → 本项目 work_type（只覆盖项目会发布的类型；
+# 5=视频消息 / 0=图文文章 / 8=图片消息，2026-11-16 实测确认）。
+_SHOW_TYPE_TO_WORK_TYPE = {5: "video", 0: "article", 8: "image"}
+
 
 # ---------------------------------------------------------------------------
 # 文章发布(2026-10 侦察实测方案)的页面注入 JS。
@@ -572,6 +595,151 @@ class WeixinGzhPlatform(BasePlatform):
 
         thread = threading.Thread(target=_launch, daemon=True)
         thread.start()
+
+    # ------------------------------------------------------------------
+    # list_works — 作品关联 / 数据同步数据源（发表记录 + 内容分析）
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取公众号「发表记录」作品列表(按发布时间倒序) + 阅读数。
+
+        实现(2026-11-16 踩点):
+        - ``/cgi-bin/appmsgpublish?sub=list`` 一次拿全已发表内容(发布+群发),
+          ``publish_page`` 是 JSON 字符串需二次 loads；``appmsgex[].aid``
+          ('msgId_itemIdx' 形式) 作 work_id，``link`` 即公开作品页 URL
+        - ``/misc/appmsganalysis?action=get_article_list`` 补阅读人数
+          (total_read_uv → views)：msg_id/item_idx 与 aid 一一对应；
+          接口只返回产生过阅读数据的内容，新发布内容数据 T+1 生成，
+          未出现时 views 为 0，后续同步轮快照自动覆盖为真实阅读数
+        - 点赞/评论/收藏/分享该接口不提供 → 恒为 None（统计列可空）
+        - work_type 过滤: item_show_type 5=video / 0=article / 8=image；
+          未知类型一律跳过
+        - 登录态判定: 首页 15s 内解析不到 token 即 cookie 失效 → log + []
+        """
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                token = await self._resolve_token(page)
+                if not token:
+                    logger.info("[weixin_gzh list_works] cookie 失效(解析不到 token)")
+                    return []
+
+                publish_resp = await page.goto(
+                    _PUBLISH_LIST_PATH.format(token=token),
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                publish_body = await publish_resp.json()
+                base = publish_body.get("base_resp") or {}
+                if base.get("ret") != 0:
+                    logger.info(
+                        "[weixin_gzh list_works] 发表记录接口异常: %s", base
+                    )
+                    return []
+                publish_page = json.loads(publish_body.get("publish_page") or "{}")
+
+                works = []
+                for record in publish_page.get("publish_list", []):
+                    info = json.loads(record.get("publish_info") or "{}")
+                    for item in info.get("appmsgex", []):
+                        work = self._publish_item_to_work(item)
+                        if work:
+                            works.append(work)
+
+                # 补真实阅读数（无数据的作品保持默认 0）
+                read_uv = await self._fetch_article_read_uv(page, token)
+                for w in works:
+                    uv = read_uv.get(w["work_id"])
+                    if uv is not None:
+                        w["views"] = uv
+
+                # 类型路由：同一列表混着视频/文章/图集，按 work_type 过滤
+                # （_match_work 还会按类型过滤一次，这里提前滤保证 limit 有效）
+                if work_type:
+                    works = [w for w in works if w["work_type"] == work_type]
+                works = works[: max(1, min(int(limit or 20), 50))]
+                logger.info("[weixin_gzh list_works] 抓到 %d 条作品", len(works))
+                return works
+            except Exception as e:
+                logger.info(f"[weixin_gzh list_works] 抓取失败: {e}")
+                return []
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        finally:
+            await self.close_browser(browser, is_close_by_code=True)
+
+    @staticmethod
+    async def _fetch_article_read_uv(page, token: str) -> dict:
+        """内容分析单篇阅读数：aid → total_read_uv（无数据的内容不在返回里）。"""
+        now = int(time.time())
+        url = _ARTICLE_STAT_PATH.format(
+            begin=now - 90 * 86400, end=now + 86400, token=token
+        )
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            body = await resp.json()
+        except Exception as exc:
+            logger.info("[weixin_gzh list_works] 内容分析接口失败: %s", exc)
+            return {}
+        if (body.get("base_resp") or {}).get("ret") != 0:
+            logger.info(
+                "[weixin_gzh list_works] 内容分析接口异常: %s", body.get("base_resp")
+            )
+            return {}
+        stats = {}
+        for article in body.get("article_list", []):
+            aid = f"{article.get('msg_id')}_{article.get('item_idx')}"
+            uv = article.get("total_read_uv")
+            if aid and isinstance(uv, int):
+                stats[aid] = uv
+        return stats
+
+    @staticmethod
+    def _publish_item_to_work(item) -> dict | None:
+        """发表记录单条 appmsgex → 契约 dict（work_id=aid, url=公开链接）。"""
+        if not isinstance(item, dict):
+            return None
+        work_id = str(item.get("aid") or "").strip()
+        if not work_id:
+            return None
+        if item.get("is_deleted"):
+            return None
+        work_type = _SHOW_TYPE_TO_WORK_TYPE.get(item.get("item_show_type"))
+        if work_type is None:
+            return None
+
+        title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:120]
+        ts = item.get("create_time") or item.get("update_time")
+        publish_time = ""
+        if isinstance(ts, (int, float)) and ts > 0:
+            try:
+                publish_time = datetime.fromtimestamp(int(ts)).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except (ValueError, OSError, OverflowError):
+                pass
+        return {
+            "work_id": work_id,
+            "work_type": work_type,
+            "title": title,
+            "publish_time": publish_time,
+            "url": str(item.get("link") or "").strip(),
+            # 接口查不到 = 平台还没记录到阅读数据，记 0（数据 T+1 生成后
+            # 由 _fetch_article_read_uv 覆盖为真实阅读数）
+            "views": 0,
+            "likes": None,
+            "favorites": None,
+            "comments": None,
+            "share": None,
+        }
 
     # ------------------------------------------------------------------
     # publish_video — 公众号视频发布（同步入口）
