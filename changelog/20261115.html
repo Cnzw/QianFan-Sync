@@ -579,3 +579,31 @@
 <footer>
   <p>v1.3.1 · 2026.11.15 · <a href="https://github.com/DevilJie/social-auto-upload-web-ui">GitHub</a></p>
 </footer>
+
+</footer>
+
+<script>
+  // 顶部栏滚动时加深背景
+  const topbar = document.getElementById('topbar');
+  window.addEventListener('scroll', () => {
+    if (window.scrollY > 20) topbar.classList.add('scrolled');
+    else topbar.classList.remove('scrolled');
+  });
+
+  // GSAP 入场动画(沿用 v1.2.9 风格)
+  if (window.gsap) {
+    gsap.registerPlugin(ScrollTrigger);
+    gsap.to('.reveal', {
+      opacity: 1, y: 0, duration: .8, ease: 'power3.out', stagger: .08,
+      scrollTrigger: { trigger: '.reveal', start: 'top 90%', toggleActions: 'play none none none' }
+    });
+    const tl = gsap.timeline();
+    tl.to('.hero .reveal', { opacity: 1, y: 0, duration: .8, ease: 'power3.out', stagger: .12 }, 0.1);
+  } else {
+    document.querySelectorAll('.reveal').forEach(el => el.style.opacity = 1);
+  }
+</script>
+
+</body>
+</html>
+
