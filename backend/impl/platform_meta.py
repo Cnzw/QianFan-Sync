@@ -102,6 +102,18 @@ PLATFORM_META: dict[str, dict] = {
                 {"label": "原创", "value": True}, {"label": "非原创", "value": False}]},
             {"key": "scheduleTime", "label": "定时发布", "type": "datetime", "placeholder": "yyyy-MM-dd HH:mm:ss"},
             {"key": "videoFormat", "label": "视频格式", "type": "radio", "options": _opt("landscape", "portrait")},
+            {"key": "ksAuthorService", "label": "作者服务", "type": "select", "options": _opt("关联小程序"),
+             "note": "选择「关联小程序」后需填小程序链接"},
+            {"key": "ksMiniAppLink", "label": "小程序链接", "type": "input",
+             "visible_when": {"key": "ksAuthorService", "value": "关联小程序"},
+             "placeholder": "粘贴从快手APP复制的小程序页面链接"},
+            {"key": "ksLocationName", "label": "添加地点", "type": "poiSelect",
+             "note": "搜索并选择 POI,同城页展示(城市为账号/IP 所在城市)"},
+            {"key": "ksVisibility", "label": "查看权限", "type": "radio", "options": _opt(
+                "所有人可见", "好友可见", "仅自己可见")},
+            {"key": "ksAllowSameFrame", "label": "允许别人跟我拍同框", "type": "switch"},
+            {"key": "ksAllowDownload", "label": "允许下载此作品", "type": "switch"},
+            {"key": "ksNearbyShow", "label": "作品展示在同城页", "type": "switch"},
         ],
         "note": "标签最多 4 个",
     },
@@ -139,6 +151,7 @@ PLATFORM_META: dict[str, dict] = {
         "name": "百家号",
         "creator_url": "https://baijiahao.baidu.com/",
         "schedule": {"max_days": 7},
+        "note": "百家号视频：标题仅存于发布记录，平台作品标题取描述内容",
         "fields": [
             {"key": "isOriginal", "label": "原创声明", "type": "radio", "options": [
                 {"label": "原创", "value": True}, {"label": "非原创", "value": False}]},
@@ -202,6 +215,8 @@ PLATFORM_META: dict[str, dict] = {
         "name": "微博",
         "creator_url": "https://weibo.com/set/index",
         "fields": [
+            {"key": "scheduleTime", "label": "定时发布", "type": "datetime", "placeholder": "yyyy-MM-dd HH:mm:ss",
+             "note": "仅已获定时发布权限的账号可用; 设置失败会报错, 不会静默立即发布"},
             {"key": "videoType", "label": "类型", "type": "radio", "options": _opt("原创", "二创", "转载")},
             {"key": "weiboCategory", "label": "分类", "type": "cascader",
              "placeholder": "[频道, 子分类]，如 [\"VLOG\", \"旅行\"]",
@@ -210,7 +225,8 @@ PLATFORM_META: dict[str, dict] = {
                              "电影", "电视剧", "人文艺术", "旅游", "科技数码", "汽车", "舞蹈", "社会资讯", "纪录片"),
              "note": "共 25 频道 255 子分类，此处仅列频道；子分类按用户指定传入"},
             {"key": "contentStatement", "label": "内容声明", "type": "select", "required": False, "options": _opt(
-                "无", "内容为自主创作", "内容为转载", "内容由AI生成", "内容为虚构演绎")},
+                "无", "内容为自主创作", "内容为转载", "内容由AI生成", "内容为虚构演绎"),
+             "note": "声明2 未设置时自动按本字段映射选上(转载/AI/虚构演绎一一对应,自主创作→内容无需标注)"},
             {"key": "contentStatement2", "label": "内容声明2", "type": "select", "required": True, "options": _opt(
                 "内容无需标注", "内容为转载", "含AI生成内容", "含虚构演绎内容", "个人观点，仅供参考", "内容含营销信息")},
             {"key": "contentStatement2Optional", "label": "内容声明2(可选)", "type": "select", "required": False, "options": _opt(
@@ -355,7 +371,7 @@ PLATFORM_META: dict[str, dict] = {
 DEFAULT_CONFIGS: dict[str, dict] = {
     "douyin": {"title": "", "description": "", "tags": [], "aiContent": "", "isOriginal": False, "scheduleTime": "", "activityId": [], "hotspotId": "", "hotspotData": None, "selectedTag": None, "tagType": "", "tagValue": "", "mixId": "", "mixData": None},
     "xiaohongshu": {"title": "", "description": "", "aiContent": "", "isOriginal": False, "scheduleTime": "", "tags": [], "collectionId": "", "collectionName": "", "collectionData": None},
-    "kuaishou": {"title": "", "description": "", "aiContent": "", "isOriginal": False, "scheduleTime": "", "tags": []},
+    "kuaishou": {"title": "", "description": "", "aiContent": "", "isOriginal": False, "scheduleTime": "", "tags": [], "ksAuthorService": "", "ksMiniAppLink": "", "ksLocationName": "", "ksLocationData": None, "ksVisibility": "所有人可见", "ksAllowSameFrame": True, "ksAllowDownload": True, "ksNearbyShow": True},
     "bilibili": {"title": "", "description": "", "zone": "", "tags": [], "creationDeclaration": "", "biliRepostSource": "", "biliKeepSystemTags": True, "isOriginal": False, "scheduleTime": "", "biliCollectionName": "", "biliCollectionData": None, "biliTopicName": "", "biliVisibility": "public", "biliCloseDanmaku": False, "biliCloseComment": False, "biliFeaturedComment": False, "biliFansDynamic": ""},
     "channels": {"title": "", "description": "", "isOriginal": False, "scheduleTime": "", "tags": [], "channelsCollectionName": "", "channelsCollectionData": None, "channelsLocationName": "", "channelsLocationData": None, "channelsActivityName": "", "channelsActivityData": None, "channelsMarkTag": "无需标注", "channelsShootDate": "", "channelsShootRegion": [], "channelsRepostSource": "", "channelsDrama": [], "channelsLinkType": "", "channelsLinkArticleUrl": "", "channelsRedEnvelopeUrl": ""},
     "baijiahao": {"title": "", "description": "", "isOriginal": False, "scheduleTime": "", "tags": []},
