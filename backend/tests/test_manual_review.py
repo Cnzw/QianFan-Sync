@@ -4,7 +4,7 @@ import ast
 import importlib.util
 from pathlib import Path
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 IMPL = Path(__file__).resolve().parents[1] / 'impl'
 spec = importlib.util.spec_from_file_location('manual_review', IMPL / '_manual_review.py')
@@ -156,7 +156,12 @@ class ManualReviewTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse((IMPL / 'xiaohongshu/platform.py').read_text(encoding='utf-8'))
         fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == '_click_publish_button')
         gate = AsyncMock()
-        namespace = {'wait_for_manual_publish': gate}
+        # b783b29 起 _click_publish_button 按「发布提交方式」设置分流：
+        # 人工验收（manual_review_enabled() 为真）→ 只等待用户亲自提交
+        namespace = {
+            'wait_for_manual_publish': gate,
+            'manual_review_enabled': Mock(return_value=True),
+        }
         exec(compile(ast.Module(body=[fn], type_ignores=[]), '<test>', 'exec'), namespace)
         page = object()
         await namespace['_click_publish_button'](page, '定时发布')

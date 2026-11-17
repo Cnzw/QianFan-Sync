@@ -67,10 +67,57 @@ class UploadEntryTests(unittest.IsolatedAsyncioTestCase):
         self.page.screenshot.assert_awaited_once()
         self.file.set_input_files.assert_not_called()
 
-    def test_final_automatic_done_click_is_removed(self):
-        text = SOURCE.read_text(encoding='utf-8')
-        self.assertNotIn('await done_btn.click()', text)
-        self.assertIn("await wait_for_manual_publish(page, 'youtube')", text)
+    def test_final_automatic_done_click_only_in_auto_mode(self):
+        """最终提交按「发布提交方式」设置分流（b783b29）。
+
+        - 人工验收（manual_review_enabled() 为真）分支必须等待用户亲自提交：
+          wait_for_manual_publish(page, 'youtube')
+        - done 自动点击只允许存在于自动提交（为假）的 else 分支内，
+          验收模式下不可触达。
+        """
+        tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
+
+        def is_call(node, func_name):
+            return (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == func_name)
+
+        review_ifs = [n for n in ast.walk(tree)
+                      if isinstance(n, ast.If) and is_call(n.test, 'manual_review_enabled')]
+        self.assertTrue(review_ifs, 'youtube 最终提交缺少 manual_review_enabled 分流')
+
+        in_review_body, in_auto_else = set(), set()
+        for node in review_ifs:
+            for sub in node.body:
+                in_review_body.update(id(n) for n in ast.walk(sub))
+            for sub in node.orelse:
+                in_auto_else.update(id(n) for n in ast.walk(sub))
+
+        # 人工验收分支：等待用户亲自提交（youtube 专属成功信号在
+        # wait_for_manual_publish 内按 share dialog 检测）
+        gated = any(
+            isinstance(n, ast.Await)
+            and is_call(n.value, 'wait_for_manual_publish')
+            and any(isinstance(a, ast.Constant) and a.value == 'youtube'
+                    for a in n.value.args)
+            for node in review_ifs
+            for sub in node.body
+            for n in ast.walk(sub)
+        )
+        self.assertTrue(gated, "人工验收分支必须调用 wait_for_manual_publish(page, 'youtube')")
+
+        # done 自动点击：必须存在（自动提交默认行为），且只能在 else 分支内
+        done_clicks = [n for n in ast.walk(tree)
+                       if isinstance(n, ast.Await)
+                       and isinstance(n.value, ast.Call)
+                       and isinstance(n.value.func, ast.Attribute)
+                       and n.value.func.attr == 'click'
+                       and isinstance(n.value.func.value, ast.Name)
+                       and n.value.func.value.id == 'done_btn']
+        self.assertTrue(done_clicks, '自动提交分支的 done 点击丢失')
+        for n in done_clicks:
+            self.assertIn(id(n), in_auto_else,
+                          'done 自动点击必须只存在于 manual_review_enabled() 为假的 else 分支内')
 
 
 if __name__ == '__main__':
