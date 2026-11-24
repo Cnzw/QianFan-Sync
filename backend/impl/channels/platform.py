@@ -27,6 +27,7 @@ from .._browser import create_browser_sync, create_context_sync
 from .._utils import (
     clear_and_type,
     get_account_name_by_cookie_file,
+    merge_title_into_desc,
     parse_schedule_time,
     raise_if_page_closed,
     save_login_result,
@@ -98,8 +99,8 @@ async def _upload_video_file(page, file_path: str) -> None:
 async def _fill_title_and_tags(page, title: str, tags: list[str]) -> None:
     """Type hashtags into the rich-text description editor.
 
-    视频号的主标题不再填入正文/描述区——title 由 _set_short_title 填到
-    「短标题」输入框；正文/描述区只放描述和话题标签。
+    视频号的短标题由 _set_short_title 填到「短标题」输入框；正文/描述区放
+    标题 + 描述 + 话题标签（标题在描述区也出现一次，用户要求如此）。
     """
     await page.locator("div.input-editor").click()
     for tag in tags:
@@ -115,7 +116,7 @@ async def _fill_title_and_tags(page, title: str, tags: list[str]) -> None:
 async def _fill_description(page, desc: str) -> None:
     """Type the description into the rich-text description editor.
 
-    描述填入正文/描述区（与话题标签同区），title 不再混入此处。
+    描述填入正文/描述区（与话题标签同区）；调用方负责把标题并进来。
     """
     if not desc:
         return
@@ -1864,8 +1865,10 @@ class ChannelsPlatform(BasePlatform):
 
                             # Fill metadata
                             # title → 短标题输入框（_set_short_title，稍后填）
-                            # 正文/描述区 → desc + tags
-                            await _fill_description(page, desc)
+                            # 正文/描述区 → 标题 + 描述 + 标签（标题同时出现在短标题和描述，用户要求）
+                            await _fill_description(
+                                page, merge_title_into_desc(title, desc)
+                            )
                             await pause_after_input()
                             await _fill_title_and_tags(page, title, tags)
                             await pause_after_input()
