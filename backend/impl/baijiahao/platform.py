@@ -953,12 +953,12 @@ class BaijiahaoPlatform(BasePlatform):
 
         背景(2026-11-02 E2E): videoV2 页面实现上无独立标题输入框时, 平台
         作品标题 = 描述文本 + #话题; 不同页面版本可能带「添加标题获得更多
-        推荐」类占位的标题输入框 —— 检测到可见且为空的才填(title 与描述
-        相同则跳过, 避免标题描述重复占 50 字上限); 检测不到维持现状并打
-        info 日志说明。纯检测+填充, 任何异常吞掉, 不影响发布主流程。
+        推荐」类占位的标题输入框 —— 检测到可见且为空的才填(title 已出现在
+        描述文本里则跳过, 避免标题描述重复占 50 字上限); 检测不到维持现状并
+        打 info 日志说明。纯检测+填充, 任何异常吞掉, 不影响发布主流程。
         """
         t = (title or "").strip()[:50]
-        if not t or t == (desc_text or "").strip():
+        if not t or t in (desc_text or ""):
             return
         try:
             state = await page.evaluate(
