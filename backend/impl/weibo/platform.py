@@ -383,7 +383,10 @@ class WeiboPlatform(BasePlatform):
           ``[channel_name, sub_name]``;也兼容 ``"channel|sub"`` 字符串
         - ``ai_content`` (*str*, optional) -- 类型声明(原创/二创/转载)
 
-        V1 暂不支持定时发布;``schedule_time_str`` 等参数被忽略。
+        - ``enableTimer`` (*bool*, optional)
+        - ``schedule_time_str`` (*str*, optional) -- 定时发布时间
+          (``YYYY-MM-DD HH:mm[:ss]``, 今天~今天+7 天; 仅已获定时发布权限的
+          账号可用, 设置失败直接报错, 不会静默退回立即发布)
         """
         asyncio.run(self._upload_all(**kwargs))
         return True
@@ -827,6 +830,9 @@ class WeiboPlatform(BasePlatform):
         content_statement2 = kwargs.get("content_statement2", "") or ""
         content_statement2_optional = kwargs.get("content_statement2_optional", "") or ""
         weibo_collection = kwargs.get("weibo_collection", "") or ""
+        # 定时发布(2026-11-08 起账号侧支持;此前 V1 忽略该参数)
+        enable_timer = bool(kwargs.get("enableTimer", False))
+        schedule_time_str = kwargs.get("schedule_time_str", "") or ""
 
         # 打印发布参数摘要
         logger.info("[发布参数] 标题: %s", title)
@@ -840,7 +846,10 @@ class WeiboPlatform(BasePlatform):
         logger.info("[发布参数] 类型声明: %s", ai_content or "无")
         logger.info("[发布参数] 内容声明: %s", content_statement or "无")
         logger.info("[发布参数] 微博合集: %s", weibo_collection or "无")
-        logger.info("[发布策略] 发布策略: immediate")
+        logger.info(
+            "[发布策略] 发布策略: %s",
+            f"scheduled({schedule_time_str})" if enable_timer and schedule_time_str else "immediate",
+        )
 
         account_paths = [
             str(Path(BASE_DIR / "cookiesFile") / f) for f in account_file
@@ -875,6 +884,8 @@ class WeiboPlatform(BasePlatform):
                         content_statement2=content_statement2,
                         content_statement2_optional=content_statement2_optional,
                         weibo_collection=weibo_collection,
+                        enable_timer=enable_timer,
+                        schedule_time_str=schedule_time_str,
                     )
 
         logger.info("=" * 60)
@@ -902,6 +913,8 @@ class WeiboPlatform(BasePlatform):
         content_statement2="",
         content_statement2_optional="",
         weibo_collection="",
+        enable_timer=False,
+        schedule_time_str="",
     ):
         """Upload a single video to one Weibo account."""
         browser = await self.create_browser(headless=False)
@@ -1012,6 +1025,12 @@ class WeiboPlatform(BasePlatform):
                 await self._set_content_statement(
                     page, content_statement, content_statement2, content_statement2_optional
                 )
+
+                # 定时发布(账号需已获定时权限;设置失败必须报错,
+                # 防止「想定时却立即发出去」的事故)
+                if schedule_time_str:
+                    logger.info("[定时发布] 开始设置定时发布: %s", schedule_time_str)
+                    await self._set_schedule_time(page, schedule_time_str)
 
                 # 点发布
                 logger.info("[发布] 正在点击发布按钮...")
@@ -1834,7 +1853,9 @@ class WeiboPlatform(BasePlatform):
 
         前端用 3 个独立下拉分别承载两套声明,后端探测到哪种 UI 就用对应那套值:
         - 版本1 UI → 用 v1_stmt
-        - 版本2 UI → 用 v2_required(必选) + v2_optional(可选)
+        - 版本2 UI → 用 v2_required(必选) + v2_optional(可选);
+          v2_required 未设置时按声明1 的值近义映射自动补全
+          (转载/AI/虚构演绎 直接对应,自主创作→内容无需标注)
 
         Args:
             v1_stmt: 版本1 声明值(5 选 1,或「无」/空=不设置)。
@@ -1842,6 +1863,26 @@ class WeiboPlatform(BasePlatform):
                 时点「内容无需标注」(必选区必须选一个)。
             v2_optional: 版本2「可选」区声明值。空=不选。
         """
+        # 声明1 → 声明2 近义映射:声明2 未设置且声明1 已选时,把声明1 的值
+        # 映射到声明2 直接选上(MCP/前端只传声明1 也能覆盖版本2 UI 账号)。
+        # 「内容为自主创作」在声明2 无对应项,归入「内容无需标注」。
+        _V1_TO_V2_MAP = {
+            "无": "内容无需标注",
+            "内容无需标注": "内容无需标注",
+            "内容为自主创作": "内容无需标注",
+            "内容为转载": "内容为转载",
+            "内容由AI生成": "含AI生成内容",
+            "内容为虚构演绎": "含虚构演绎内容",
+        }
+        if not v2_required and v1_stmt:
+            mapped = _V1_TO_V2_MAP.get(v1_stmt.strip())
+            if mapped:
+                logger.info(
+                    "[内容声明] 声明2 未设置,按声明1「%s」自动映射为「%s」",
+                    v1_stmt, mapped,
+                )
+                v2_required = mapped
+
         # 先探测版本2 trigger「请进行内容声明（必填）」是否存在
         # 注意:不能用 exact=True,实际 DOM 文本可能含全角括号或前后空白,
         # 用 contains 匹配更稳。探测全程打日志,绝不静默吞异常。
@@ -2039,6 +2080,122 @@ class WeiboPlatform(BasePlatform):
     # ------------------------------------------------------------------
     # Helper: click 发布 button
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Helper: 定时发布(2026-11-08 踩点实证)
+    # ------------------------------------------------------------------
+
+    # 定时发布可选日期范围: 今天 ~ 今天+7 天(与平台 date-picker 禁用规则一致)
+    _VIDEO_TIMING_MAX_DAYS = 7
+
+    @staticmethod
+    async def _set_schedule_time(page, schedule_time_str: str):
+        """设置视频定时发布时间。
+
+        DOM(2026-11-08 踩点实证, weibo.com/upload/channel 视频表单):
+          - 定时开关图标: div[class*='_timer_'](内含 svg use
+            #woo_svg_nav_timer, 带 NEW 角标; 仅已获定时发布权限的账号显示),
+            点击在「设置微博内容」区展开定时面板
+          - 面板: 「发布时间」label + span.wbpro-datapicker > input
+            (日期, value 'YYYY/MM/DD', 默认今天) + 两个 vue-multiselect
+            (第一个=时, 第二个=分, .multiselect__single 显示「N 时/ M 分」,
+            默认 server_time+15min) + 「剩余 N 次」(每日定时次数限制)
+          - 日期可选范围: 今天 ~ 今天+7 天, 分钟精度
+
+        语义安全: 设置失败直接抛异常 —— 绝不能静默退回立即发布,
+        否则会造成「想定时却立即发出去」的事故。
+        """
+        from datetime import datetime as _dt, timedelta as _td
+
+        target = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                target = _dt.strptime(schedule_time_str.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if target is None:
+            raise ValueError(f"定时发布时间格式无法解析: {schedule_time_str!r}")
+
+        # 日期范围校验(与平台 date-picker 可选范围一致)
+        today = _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tday = target.replace(hour=0, minute=0, second=0, microsecond=0)
+        if tday < today or tday > today + _td(days=WeiboPlatform._VIDEO_TIMING_MAX_DAYS):
+            raise ValueError(
+                "定时发布时间超出可选范围(今天 ~ 今天+"
+                f"{WeiboPlatform._VIDEO_TIMING_MAX_DAYS} 天): {schedule_time_str}"
+            )
+
+        # 1. 展开定时面板(「发布时间」文本可见 = 已展开)
+        if not await page.get_by_text("发布时间", exact=True).first.is_visible():
+            timer_icon = page.locator("div[class*='_timer_']").first
+            if not await timer_icon.count():
+                raise RuntimeError(
+                    "微博视频发布页未找到定时发布入口"
+                    "(该账号可能未获得定时发布权限, 请先在平台确认)"
+                )
+            await timer_icon.scroll_into_view_if_needed()
+            await timer_icon.click()
+            await asyncio.sleep(2)
+            if not await page.get_by_text("发布时间", exact=True).first.is_visible():
+                await page.screenshot(
+                    path=str(Path(BASE_DIR / "logs" / "weibo_schedule_open_fail.png")),
+                    full_page=True,
+                )
+                raise RuntimeError("点击定时图标后定时面板未展开")
+
+        # 2. 日期(vue2 datepicker 输入框, 'YYYY/MM/DD')
+        date_input = page.locator("span.wbpro-datapicker input").first
+        if not await date_input.count():
+            raise RuntimeError("未找到定时发布日期输入框")
+        want_date = target.strftime("%Y/%m/%d")
+        cur_date = (await date_input.input_value() or "").strip()
+        if cur_date != want_date:
+            await date_input.click()
+            await date_input.fill(want_date)
+            await asyncio.sleep(0.5)
+            now_date = (await date_input.input_value() or "").strip()
+            if now_date != want_date:
+                raise RuntimeError(
+                    f"定时日期设置失败: 期望 {want_date}, 实际 {now_date or '(空)'}"
+                )
+
+        # 3. 时 / 分(vue-multiselect: 点开下拉 → 点选匹配项 → 校验回显)
+        selects = page.locator(".multiselect")
+        n_selects = await selects.count()
+        if n_selects < 2:
+            raise RuntimeError(
+                f"定时面板未找到时/分下拉(multiselect 数量 {n_selects} < 2)"
+            )
+        for idx, (value, label) in enumerate(
+            ((target.hour, "时"), (target.minute, "分"))
+        ):
+            ms = selects.nth(idx)
+            await ms.locator(".multiselect__select").first.click()
+            await asyncio.sleep(1)
+            option = page.locator(
+                "li.multiselect__element span.multiselect__option",
+                has_text=f"{value} {label}",
+            ).first
+            if not await option.count():
+                # 收起下拉,避免遮挡后续操作
+                await page.keyboard.press("Escape")
+                raise RuntimeError(f"定时发布「{label}」下拉中未找到选项: {value} {label}")
+            await option.click()
+            await asyncio.sleep(0.5)
+            shown = (
+                await ms.locator(".multiselect__single").first.text_content() or ""
+            ).strip()
+            if not shown.startswith(f"{value} "):
+                raise RuntimeError(
+                    f"定时发布「{label}」设置失败: 期望 {value} {label}, 回显 {shown!r}"
+                )
+
+        logger.info(
+            "[定时发布] 已设置定时发布时间: %s",
+            target.strftime("%Y-%m-%d %H:%M"),
+        )
+
 
     @staticmethod
     async def _click_publish(page):
@@ -3673,20 +3830,36 @@ class WeiboPlatform(BasePlatform):
 
     @staticmethod
     async def _article_statement_option_rect(page, target):
-        """「内容声明」子菜单选项坐标。"""
+        """「内容声明」子菜单选项坐标。
+
+        主匹配 `.extend-box__content__item` 精确文本; 类名改版时兜底
+        `.extend-box` 内任意可见叶子节点的精确文本(2026-11-10 发布实测
+        子菜单偶发未展开/类名差异导致匹配落空)。
+        """
         return await page.evaluate(
             """(target) => {
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 return r.width > 0 && r.height > 0;
               };
+              const center = (el) => {
+                const r = el.getBoundingClientRect();
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+              };
               const items = [...document.querySelectorAll(
                   '.extend-box__content__item')].filter(
                 (el) => vis(el)
                   && (el.innerText || '').trim() === target);
-              if (!items.length) return null;
-              const r = items[0].getBoundingClientRect();
-              return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+              if (items.length) return center(items[0]);
+              // 兜底: extend-box 容器内最深匹配叶子
+              const box = [...document.querySelectorAll('.extend-box')]
+                .find(vis);
+              if (!box) return null;
+              const leaves = [...box.querySelectorAll('*')].filter(
+                (el) => vis(el) && el.children.length === 0
+                  && (el.innerText || '').trim() === target);
+              // 取最浅匹配(标题容器等祖先已在叶子过滤中排除)
+              return leaves.length ? center(leaves[0]) : null;
             }""",
             target,
         )
@@ -3816,19 +3989,39 @@ class WeiboPlatform(BasePlatform):
             entry = await self._article_dropdown_extend_rect(page, "公开")
             if not entry:
                 raise RuntimeError("未找到内容声明入口(公开项右侧)")
-            await page.mouse.move(entry["x"], entry["y"])
-            await asyncio.sleep(1.2)
-            opt = await self._article_statement_option_rect(
-                page, target_statement
-            )
-            if not opt:
-                await asyncio.sleep(1.5)
+            # 子菜单偶发不展开(hover 事件丢失/动画竞态):重试时先移开鼠标
+            # 再重新悬停入口,重新触发 hover 展开(2026-11-10 发布实测)
+            opt = None
+            for attempt in range(3):
+                if attempt > 0:
+                    entry2 = await self._article_dropdown_extend_rect(
+                        page, "公开"
+                    )
+                    if not entry2:
+                        break
+                    await page.mouse.move(
+                        trig2["x"] - 60, trig2["y"] - 30, steps=6
+                    )
+                    await asyncio.sleep(0.6)
+                    await page.mouse.move(
+                        entry2["x"], entry2["y"], steps=6
+                    )
+                    await asyncio.sleep(1.5)
+                else:
+                    await page.mouse.move(entry["x"], entry["y"], steps=6)
+                    await asyncio.sleep(1.2)
                 opt = await self._article_statement_option_rect(
                     page, target_statement
                 )
+                if opt:
+                    break
             if not opt:
+                await self._article_screenshot(
+                    page, "weibo_article_stmt_menu_fail.png"
+                )
                 raise RuntimeError(
                     f"未找到内容声明选项: {target_statement}"
+                    "(子菜单未展开, 已截图 weibo_article_stmt_menu_fail)"
                 )
             await page.mouse.move(opt["x"], opt["y"])
             await asyncio.sleep(0.3)
@@ -4354,3 +4547,330 @@ class WeiboPlatform(BasePlatform):
                 return
             await asyncio.sleep(2)
         raise RuntimeError("[文章][微博] 身份验证后未能重新点击发布按钮")
+
+    # ==================================================================
+    # List works (作品列表抓取)
+    # ==================================================================
+
+    @staticmethod
+    def _wb_parse_count(val):
+        """把 '1.2万'/'852'/'1.3亿' 解析为 int, 解析不了返回 None。"""
+        if isinstance(val, (int, float)):
+            return int(val)
+        s = str(val or "").strip().replace(",", "").replace(" ", "")
+        if not s or not re.search(r"\d", s):
+            return None
+        try:
+            if s.endswith("亿"):
+                return int(float(s[:-1]) * 100000000)
+            if s.endswith("万"):
+                return int(float(s[:-1]) * 10000)
+            return int(float(s))
+        except (ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _wb_num_from_display(cls, number_display, dtype):
+        """从 number_display 数组按 type 取数量(解析后), 没有则 None。"""
+        for it in number_display or []:
+            if isinstance(it, dict) and it.get("type") == dtype:
+                return cls._wb_parse_count(it.get("number"))
+        return None
+
+    @classmethod
+    @classmethod
+    def _wb_mblog_to_image_work(cls, item, uid):
+        """单条 mblog JSON → 契约 dict(图集/图文稿件)。无图稿件返回 None。
+
+        图集(微博图片 album)与多图图文都是带 pic_infos/pics 的普通 mblog:
+        - work_id = mblogid; url = https://weibo.com/<uid>/<mblogid>
+        - 标题 = 正文去 HTML(发布图集无标题概念, 文本即描述)
+        - 发布时间/赞/评/转 与视频稿件同字段; 无播放量与收藏
+        """
+        if not isinstance(item, dict):
+            return None
+        work_id = item.get("mblogid") or str(item.get("id") or "")
+        if not work_id:
+            return None
+        pic_infos = item.get("pic_infos") or {}
+        pics = item.get("pic_ids") or item.get("pics") or []
+        if not pic_infos and not pics:
+            return None
+
+        text = re.sub(r"<[^>]+>", "", item.get("text") or "")
+        title = re.sub(r"\s+", " ", text).strip()[:120]
+
+        created_at = item.get("created_at") or ""
+        publish_time = created_at
+        try:
+            publish_time = datetime.strptime(
+                created_at, "%a %b %d %H:%M:%S %z %Y"
+            ).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            pass
+
+        likes = item.get("attitudes_count")
+        likes = (
+            likes if isinstance(likes, int)
+            else cls._wb_num_from_display(item.get("number_display"), "like_count")
+        )
+        comments = item.get("comments_count")
+        comments = (
+            comments if isinstance(comments, int)
+            else cls._wb_num_from_display(item.get("number_display"), "comment_count")
+        )
+        share = item.get("reposts_count")
+        share = (
+            share if isinstance(share, int)
+            else cls._wb_num_from_display(item.get("number_display"), "repeat_count")
+        )
+
+        return {
+            "work_id": work_id,
+            "work_type": "image",
+            "title": title,
+            "publish_time": publish_time,
+            "url": f"https://weibo.com/{uid}/{work_id}",
+            "views": None,
+            "likes": likes,
+            "favorites": None,
+            "comments": comments,
+            "share": share,
+        }
+
+    @classmethod
+    def _wb_mblog_to_work(cls, item, uid):
+        """单条 mblog JSON → 契约 dict。非视频稿件返回 None。"""
+        if not isinstance(item, dict):
+            return None
+        work_id = item.get("mblogid") or str(item.get("id") or "")
+        if not work_id:
+            return None
+        page_info = item.get("page_info") or {}
+        is_video = (
+            page_info.get("type") == "video"
+            or bool(page_info.get("media_info"))
+            or page_info.get("object_type") == "video"
+        )
+        if not is_video:
+            return None
+
+        # 标题: 优先视频标题, 兜底正文去 HTML 标签
+        title = (page_info.get("title") or "").strip()
+        if not title:
+            text = re.sub(r"<[^>]+>", "", item.get("text") or "")
+            title = re.sub(r"\s+", " ", text).strip()[:80]
+
+        # 发布时间: ajax 返回 "Wed Oct 26 21:00:00 +0800 2026", 转为可读文本
+        created_at = item.get("created_at") or ""
+        publish_time = created_at
+        try:
+            publish_time = datetime.strptime(
+                created_at, "%a %b %d %H:%M:%S %z %Y"
+            ).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            pass  # 格式不认识就原样保存
+
+        # 统计: 优先经典 int 字段, 兜底 number_display('x.x万' 文案)
+        views = item.get("page_info", {}).get("play_count")
+        views = (
+            cls._wb_parse_count(views)
+            if views is not None
+            else cls._wb_num_from_display(item.get("number_display"), "play_count")
+        )
+        likes = (
+            item.get("attitudes_count")
+            if isinstance(item.get("attitudes_count"), int)
+            else cls._wb_num_from_display(item.get("number_display"), "like_count")
+        )
+        comments = (
+            item.get("comments_count")
+            if isinstance(item.get("comments_count"), int)
+            else cls._wb_num_from_display(item.get("number_display"), "comment_count")
+        )
+        share = (
+            item.get("reposts_count")
+            if isinstance(item.get("reposts_count"), int)
+            else cls._wb_num_from_display(item.get("number_display"), "repeat_count")
+        )
+
+        return {
+            "work_id": work_id,
+            "work_type": "video",
+            "title": title,
+            "publish_time": publish_time,
+            "url": f"https://weibo.com/{uid}/{work_id}",
+            "views": views,
+            "likes": likes,
+            "favorites": None,  # 微博无收藏计数(转发/评论/赞已有)
+            "comments": comments,
+            "share": share,
+        }
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取个人主页视频 tab 的视频作品列表（按发布时间倒序）。
+
+        实现说明（2026-11 踩点）：
+        - 微博视频发布不导航，无创作中心管理页；视频列表走个人主页
+          视频 tab（weibo.com/u/<uid>?tab=video）。
+        - 该 tab 的数据由页内 /ajax/ JSON 接口下发（mymblog 系），DOM 是
+          hash class 且混排复杂，因此采用「响应拦截」——与本项目文章发表
+          响应拦截(_safe_json L2545)同款模式：捕获页面自己请求的 JSON，
+          从中解析 mblog 对象（mblogid/text/created_at/attitudes_count/
+          comments_count/reposts_count/number_display）。
+        - 拦截不到时兜底页内 fetch mymblog(feature=2 视频筛选)。
+        - 登录态判定：顶部导航 .woo-tab-nav 头像链接(与 login L119 同款)。
+          cookie 失效(被甩到 newlogin) → log + return []。
+        - ⚠️ 当前账号 YI32863 的 cookie 服务端会话已失效(retcode=6102)，
+          本实现尚无登录态实测样例，待重新登录后需跑一次验证。
+        """
+        if work_type not in ("video", "image", ""):
+            return []
+        # image(图集/图文): 个人主页全部微博里带图的稿件; video: 视频 tab
+        is_image_mode = work_type == "image"
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+
+            # 1. 首页 + 轮询登录态标志(最长 15s; SSO 跳转需要几秒)
+            await page.goto(
+                "https://weibo.com/", wait_until="domcontentloaded", timeout=30000
+            )
+            logged_in = False
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                try:
+                    if await page.locator(
+                        '.woo-tab-nav a[href^="/u/"] img[src*="sinaimg.cn"]'
+                    ).count() > 0:
+                        logged_in = True
+                        break
+                except Exception:
+                    pass
+            if not logged_in:
+                logger.info(
+                    "[weibo list_works] cookie 失效(15s 内未出现登录态, url=%s)",
+                    page.url,
+                )
+                return []
+
+            # 2. 取 uid
+            uid = await page.evaluate(
+                """() => {
+                    const a = document.querySelector('.woo-tab-nav a[href^="/u/"]');
+                    if (!a) return '';
+                    const m = (a.getAttribute('href') || '').match(/\\/u\\/(\\d+)/);
+                    return m ? m[1] : '';
+                }"""
+            )
+            if not uid:
+                logger.info("[weibo list_works] 已登录但未取到 uid")
+                return []
+
+            # 3. 响应拦截: 捕获个人主页 /ajax/ JSON(视频 tab 的列表接口)
+            captured = []
+
+            async def _capture(resp):
+                if "/ajax/" not in resp.url:
+                    return
+                try:
+                    if "json" not in (resp.headers.get("content-type") or ""):
+                        return
+                    body = await resp.json()
+                except Exception:
+                    return
+                if isinstance(body, dict) and body.get("ok") == 1:
+                    captured.append(body)
+
+            def on_response(resp):
+                asyncio.ensure_future(_capture(resp))
+
+            page.on("response", on_response)
+
+            if is_image_mode:
+                # 全部微博 tab(图集是带 pic_infos 的普通稿件,混在全部列表里)
+                tab_urls = (f"https://weibo.com/u/{uid}",)
+            else:
+                tab_urls = (
+                    f"https://weibo.com/u/{uid}?tab=video",
+                    f"https://weibo.com/u/{uid}?tabtype=video",
+                )
+            for tab_url in tab_urls:
+                try:
+                    await page.goto(
+                        tab_url, wait_until="domcontentloaded", timeout=30000
+                    )
+                except Exception as exc:
+                    logger.info("[weibo list_works] goto %s 失败: %s", tab_url, exc)
+                    continue
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+                if captured:
+                    break
+
+            # 4. 兜底: 页内 fetch mymblog(视频 feature=2 / 图文 feature=1)
+            #    —— 拦截空时才调
+            if not captured:
+                feature = 1 if is_image_mode else 2
+                body = await page.evaluate(
+                    """async ([uid, feature]) => {
+                        try {
+                            const resp = await fetch(
+                                '/ajax/statuses/mymblog?uid=' + uid
+                                + '&page=1&feature=' + feature,
+                                {credentials: 'include'},
+                            );
+                            return await resp.json();
+                        } catch (e) {
+                            return {ok: 0, err: String(e)};
+                        }
+                    }""",
+                    [uid, feature],
+                )
+                if isinstance(body, dict) and body.get("ok") == 1:
+                    captured.append(body)
+
+            # 5. 从全部捕获 payload 解析 mblog → 契约 dict(去重)
+            works, seen = [], set()
+            for body in captured:
+                data = body.get("data") or {}
+                items = (
+                    data.get("statuses")
+                    or data.get("list")
+                    or []
+                )
+                for item in items:
+                    work = (
+                        self._wb_mblog_to_image_work(item, uid)
+                        if is_image_mode
+                        else self._wb_mblog_to_work(item, uid)
+                    )
+                    if work and work["work_id"] not in seen:
+                        seen.add(work["work_id"])
+                        works.append(work)
+            works = works[: max(1, min(int(limit or 20), 50))]
+            logger.info(
+                "[weibo list_works] 抓到 %d 条%s作品",
+                len(works), "图文/图集" if is_image_mode else "视频",
+            )
+            return works
+        except Exception as e:
+            logger.info(f"[weibo list_works] 抓取失败: {e}")
+            return []
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
